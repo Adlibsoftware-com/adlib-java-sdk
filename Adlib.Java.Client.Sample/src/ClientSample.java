@@ -127,10 +127,12 @@ public class ClientSample {
 			if (!settings.isSynchronous()) {
 				// Submit job and only return once it's complete
 				if (fileIds.getLong().size() == 1) {
-					System.out.println("Job submitted, waiting for it to complete...");
+					System.out.println(String.format(
+							"Job submitted, waiting up to %s seconds for completion...", 
+							settings.getDefaultTimeout().toMillis() / 1000.0));
 				} else {
-					System.out.println(String.format("All %s jobs submitted, waiting for them to complete...",
-							fileIds.getLong().size()));
+					System.out.println(String.format("All %s jobs submitted, waiting up to %s seconds for completion...",
+							fileIds.getLong().size(), settings.getDefaultTimeout().toMillis() / 1000.0));
 				}				
 				processedJobs.addAll(client.waitForJobsToProcess(fileIds, settings.getDefaultTimeout(),
 						settings.getDefaultPollingInterval()));
@@ -139,7 +141,7 @@ public class ClientSample {
 			if (!settings.isStreaming()) {
 				// copy files to output folder and update Payloads
 				if (fileIds.getLong().size() == 1) {
-					System.out.println(String.format("Job complete, copying output files to output directory...",
+					System.out.println(String.format("Job complete, copying output file(s) to output directory...",
 							settings.isSynchronous() ? processedJobs.size() : fileIds.getLong().size()));
 				} else {
 					System.out.println(
@@ -161,10 +163,11 @@ public class ClientSample {
 			}
 			
 			Duration batchDuration = Duration.between(started, LocalDateTime.now());
+			long durationInMilliseconds = Math.abs(batchDuration.toMillis());
 
 			System.out.println(String.format("Successfully ran sample batch of %s jobs in %s seconds with streaming %s, synchronous %s, %s threads"
 					, processedJobs.size()
-					, batchDuration.toMillis() / 1000.0
+					, durationInMilliseconds / 1000.0
 					, settings.isStreaming() ? "on" : "off"
 					, settings.isSynchronous() ? "on" : "off"
 						, threadCount));

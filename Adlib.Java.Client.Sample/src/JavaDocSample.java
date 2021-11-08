@@ -23,7 +23,7 @@ public class JavaDocSample {
 	public static void sample(String[] args) {
 		try {
 			Settings settings = new Settings();
-			settings.setRepositoryName("CustomIntegration");
+			settings.setRepositoryName("CustomIntegration"); // must match repository name in Adlib
 			// replace [computer] with Adlib Service Server fully qualified name
 			settings.setJobManagementServiceWsdlUrl(new URL("https://[computer]:55583/Adlib/Services/JobManagement.svc?wsdl"));
 			settings.setTokenServiceUrl(new URL("https://[computer]:8088/connect/token"));
