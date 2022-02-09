@@ -32,6 +32,7 @@ import com.adlibsoftware.client.HashAlgorithm;
 import com.adlibsoftware.client.JobFile;
 import com.adlibsoftware.client.MetadataItem;
 import com.adlibsoftware.client.MetadataType;
+import com.adlibsoftware.client.OrchestrationFileStatusResponse;
 import com.adlibsoftware.client.Payload;
 import com.adlibsoftware.client.RenditionType;
 import com.adlibsoftware.exceptions.AdlibTimeoutException;
@@ -77,6 +78,7 @@ public class ClientSample {
 			
 			boolean isStreaming = settings.isStreaming();
 			boolean isSynchronous = settings.isSynchronous();
+			boolean sendReceiveBytesWhenStreaming = clientSampleSettings.getBoolean("sendReceiveBytesWhenStreaming");
 
 			List<Payload> inputPayloadList = new ArrayList<Payload>();
 			System.out.println("Making Payloads based on Sample Client Settings...");
@@ -93,7 +95,6 @@ public class ClientSample {
 							, isStreaming
 							, isSynchronous
 							, inputPayloadList.size()));
-			
 			
 			client = new JobManagementServiceClient(settings, true);
 			
@@ -114,18 +115,54 @@ public class ClientSample {
 			// start batch timer
 			LocalDateTime started = LocalDateTime.now();
 			
-			if (isStreaming && isSynchronous) {
-				// Sample streaming synchronous
-				processedJobs = executeStreamingSync(settings, inputPayloadList, outputDirectoryRoot);
-			} else if (isStreaming && !isSynchronous) {
-				// Sample code for streaming asynchronously
-				processedJobs = executeStreamingAsync(settings, inputPayloadList, outputDirectoryRoot);
-			} else if (!isStreaming && isSynchronous) {
-				// Sample file reference (on-premise) snyc
-				processedJobs = executeFileReferenceSync(settings, inputPayloadList, outputDirectoryRoot);
-			} else if (!isStreaming && !isSynchronous) {
-				// Sample file reference (on-premise) async
-				processedJobs = executeFileReferenceAsync(settings, inputPayloadList, outputDirectoryRoot);
+			// Below are sample methods broken down by options chosen in the SampleClientSettings.properties file
+			
+			if (threadCount <= 1) {
+				// single threaded path
+				
+				if (isStreaming && isSynchronous) {
+					// Sample streaming synchronous (doesn't return until timeout or job complete)
+					processedJobs = executeStreamingSync(settings, inputPayloadList, sendReceiveBytesWhenStreaming);
+				} else if (isStreaming && !isSynchronous) {
+					// Sample code for streaming asynchronously
+					processedJobs = executeStreamingAsync(settings, inputPayloadList, sendReceiveBytesWhenStreaming);
+				} else if (!isStreaming && isSynchronous) {
+					// Sample file reference (on-premise) snyc  (doesn't return until timeout or job complete)
+					processedJobs = executeFileReferenceSync(settings, inputPayloadList, outputDirectoryRoot);
+				} else if (!isStreaming && !isSynchronous) {
+					// Sample file reference (on-premise) async
+					processedJobs = executeFileReferenceAsync(settings, inputPayloadList, outputDirectoryRoot);
+				}		
+				
+				// All jobs complete, download/handle output
+				if (isStreaming) {
+					downloadProcessedJobFilesAndSetOutputFileNames(settings, processedJobs, outputDirectoryRoot, sendReceiveBytesWhenStreaming);
+				} else {
+					copyProcessedJobFilesAndSetOutputFileNames(processedJobs, outputDirectoryRoot, settings);
+				}
+			} else {
+				// threaded path
+				
+				if (isStreaming && isSynchronous) {
+					// Sample streaming synchronous (doesn't return until timeout or job complete)
+					processedJobs = executeStreamingSyncThreaded(settings, inputPayloadList, sendReceiveBytesWhenStreaming, threadCount);
+				} else if (isStreaming && !isSynchronous) {
+					// Sample code for streaming asynchronously
+					processedJobs = executeStreamingAsyncThreaded(settings, inputPayloadList, sendReceiveBytesWhenStreaming, threadCount);
+				} else if (!isStreaming && isSynchronous) {
+					// Sample file reference (on-premise) snyc  (doesn't return until timeout or job complete)
+					processedJobs = executeFileReferenceSyncThreaded(settings, inputPayloadList, outputDirectoryRoot, threadCount);
+				} else if (!isStreaming && !isSynchronous) {
+					// Sample file reference (on-premise) async
+					processedJobs = executeFileReferenceAsyncThreaded(settings, inputPayloadList, outputDirectoryRoot, threadCount);
+				}		
+				
+				// All jobs complete, download/handle output
+				if (isStreaming) {
+					downloadProcessedJobFilesAndSetOutputFileNamesThreaded(settings, processedJobs, outputDirectoryRoot, threadCount, sendReceiveBytesWhenStreaming);
+				} else {
+					copyProcessedJobFilesAndSetOutputFileNamesThreaded(processedJobs, outputDirectoryRoot, settings, threadCount);
+				}
 			}
 			
 			Duration batchDuration = Duration.between(started, LocalDateTime.now());
@@ -172,13 +209,69 @@ public class ClientSample {
 
 	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeFileReferenceAsync(Settings settings,
 			List<Payload> inputPayloadList, File outputDirectoryRoot) throws Exception {
-		int threadCount = clientSampleSettings.getInt("clientSampleThreadCount", 1);
 		
-		ExecutorService executorService = null;
+		final ArrayOflong fileIds = new ArrayOflong();
+		final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs = new ConcurrentLinkedQueue<ProcessedJobResponse>();
 		
-		if (threadCount > 1) {
-			executorService = Executors.newFixedThreadPool(threadCount);
+		File inputFileShare = new File(clientSampleSettings.getString("inputPayloadShareDirectory"));
+		System.out.println("Copying local files to file share...");
+		copyPayloadFilesToAdlibShare(inputPayloadList, inputFileShare);
+		
+		int i = 0;
+		for (Payload inputPayload : inputPayloadList) {
+			i++;
+			// Submit job and only return once it's complete
+			System.out.println(String.format("Synchronously submitting job #%s of %s", i, inputPayloadList.size()));
+			File firstFile = new File(inputPayload.getFiles().getJobFile().get(0).getPath());
+			submitFileReferencePayload(settings, fileIds, inputPayload, firstFile);		
+							
 		}
+		
+		if (fileIds.getLong().size() == 0) {
+			throw new Exception("Could not submit any files (see previous error)");
+		}
+		
+		System.out.println(String.format("All %s file reference jobs submitted, waiting up to %s seconds for completion of all jobs...",
+				fileIds.getLong().size(), settings.getDefaultTimeout().toMillis() / 1000.0));
+	
+	
+		waitForJobsToProcess(settings, fileIds, processedJobs);
+		
+		return processedJobs;
+		
+	}
+
+
+	private static void waitForJobsToProcess(Settings settings, final ArrayOflong fileIds,
+			final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs)
+			throws AdlibTimeoutException, Exception, InterruptedException {
+		LocalDateTime started = LocalDateTime.now();
+		while (fileIds.getLong().size() > 0) {
+			Duration batchDuration = Duration.between(started, LocalDateTime.now());
+			boolean timedOut = batchDuration.compareTo(settings.getDefaultTimeout()) > 0;
+			if (timedOut) {
+				throw new AdlibTimeoutException("Operation timed out", -1);
+			}
+			
+			List<Long> remainingFileIds = new ArrayList<Long>();
+			remainingFileIds.addAll(fileIds.getLong());
+			
+			for (long fileId : remainingFileIds) {
+				OrchestrationFileStatusResponse response = client.getOrchestrationStatus(fileId);
+				if (Common.isOrchestrationComplete(response)) {
+					processedJobs.add(client.getProcessedJobResponse(response));
+					fileIds.getLong().remove(fileId);
+				}
+			}
+			
+			Thread.sleep(settings.getDefaultPollingInterval().toMillis());
+		}
+	}
+	
+	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeFileReferenceAsyncThreaded(Settings settings,
+			List<Payload> inputPayloadList, File outputDirectoryRoot, int threadCount) throws Exception {
+		
+		ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
 
 		final ArrayOflong fileIds = new ArrayOflong();
 		final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs = new ConcurrentLinkedQueue<ProcessedJobResponse>();
@@ -193,27 +286,21 @@ public class ClientSample {
 			// Submit job and only return once it's complete
 			System.out.println(String.format("Synchronously submitting job #%s of %s", i, inputPayloadList.size()));
 			File firstFile = new File(inputPayload.getFiles().getJobFile().get(0).getPath());
-			if (executorService != null) {
-				executorService.execute(new Runnable() {
+			executorService.execute(new Runnable() {
 					public void run() {
 						submitFileReferencePayload(settings, fileIds, inputPayload, firstFile);						
 					}					
-				});
-			} else {
-				submitFileReferencePayload(settings, fileIds, inputPayload, firstFile);		
-			}				
+				});		
 		}
 
-		if (executorService != null) {
-			executorService.shutdown();
-			boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
+		executorService.shutdown();
+		boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
 
-			if (timedOut) {
-				throw new TimeoutException("Operation timed out");
-			}
-			// reset
-			executorService = Executors.newFixedThreadPool(threadCount);
+		if (timedOut) {
+			throw new TimeoutException("Operation timed out");
 		}
+		// reset
+		executorService = Executors.newFixedThreadPool(threadCount);
 		
 		if (fileIds.getLong().size() == 0) {
 			throw new Exception("Could not submit any files (see previous error)");
@@ -222,31 +309,22 @@ public class ClientSample {
 		System.out.println(String.format("All %s file reference jobs submitted, waiting up to %s seconds for completion of all jobs...",
 				fileIds.getLong().size(), settings.getDefaultTimeout().toMillis() / 1000.0));
 	
-		// If threaded, add fileIds to thread pool to have them all call/wait in own thread
-		if (executorService != null) {
-			for (long fileId : fileIds.getLong()) {
-				executorService.execute(new Runnable() {
-					public void run() {
-						try {
-							System.out.println(String.format("Waiting for FileID %s to finish...", fileId));
-							processedJobs.add(client.waitForJobToProcess(fileId, settings.getDefaultTimeout(), settings.getDefaultPollingInterval()));
-						} catch (AdlibTimeoutException e) {
-							System.err.println(String.format("Operation Timed out for FileId %s", e.toString(), e.getId()));
-						} catch (Exception e) {
-							System.err.println(String.format("Unknown error: %s", e.toString()));
-						}
-					}					
-				});
-			}
-			
-		} else {
-			processedJobs.addAll(client.waitForJobsToProcess(fileIds, settings.getDefaultTimeout(),
-					settings.getDefaultPollingInterval()));
+		// add fileIds to thread pool to have them all call/wait in own thread
+		for (long fileId : fileIds.getLong()) {
+			executorService.execute(new Runnable() {
+				public void run() {
+					try {
+						System.out.println(String.format("Waiting for FileID %s to finish...", fileId));
+						processedJobs.add(client.waitForJobToProcess(fileId, settings.getDefaultTimeout(), settings.getDefaultPollingInterval()));
+					} catch (AdlibTimeoutException e) {
+						System.err.println(String.format("Operation Timed out for FileId %s", e.toString(), e.getId()));
+					} catch (Exception e) {
+						System.err.println(String.format("Unknown error: %s", e.toString()));
+					}
+				}					
+			});			
 		}
-
-		copyProcessedJobFilesAndSetOutputFileNames(executorService, processedJobs, outputDirectoryRoot, settings);
-		return processedJobs;
-		
+		return processedJobs;		
 	}
 
 
@@ -296,22 +374,46 @@ public class ClientSample {
 		
 		if (processedJobs.size() == 0) {
 			throw new Exception("Could not submit any files (see previous error)");
-		}
+		}		
+		return processedJobs;
+	}
+	
+	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeFileReferenceSyncThreaded(Settings settings, List<Payload> inputPayloadList,
+			File outputDirectoryRoot, int threadCount) throws Exception {
+		
+		ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
 
-		copyProcessedJobFilesAndSetOutputFileNames(executorService, processedJobs, outputDirectoryRoot, settings);
+		final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs = new ConcurrentLinkedQueue<ProcessedJobResponse>();
+		
+		File inputFileShare = new File(clientSampleSettings.getString("inputPayloadShareDirectory"));
+		System.out.println("Copying local files to file share...");
+		copyPayloadFilesToAdlibShare(inputPayloadList, inputFileShare);
+		
+		int i = 0;
+		for (Payload inputPayload : inputPayloadList) {
+			i++;
+			// Submit job and only return once it's complete
+			System.out.println(String.format("Synchronously submitting job #%s of %s", i, inputPayloadList.size()));
+			File firstFile = new File(inputPayload.getFiles().getJobFile().get(0).getPath());
+			executorService.execute(new Runnable() {
+					public void run() {
+						submitPayloadSynchronously(settings, processedJobs, inputPayload, firstFile);						
+					}					
+				});		
+		}
+		
+		if (processedJobs.size() == 0) {
+			throw new Exception("Could not submit any files (see previous error)");
+		}		
 		return processedJobs;
 	}
 
 
-	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeStreamingSync(Settings settings, List<Payload> inputPayloadList, File outputDirectoryRoot) throws Exception {
+	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeStreamingSync(
+			Settings settings, 
+			List<Payload> inputPayloadList, 
+			boolean sendReceiveBytesWhenStreaming) throws Exception {
 
-		int threadCount = clientSampleSettings.getInt("clientSampleThreadCount", 1);
-		
-		ExecutorService executorService = null;
-		
-		if (threadCount > 1) {
-			executorService = Executors.newFixedThreadPool(threadCount);
-		}
 		final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs = new ConcurrentLinkedQueue<ProcessedJobResponse>();
 		
 		int i = 0;
@@ -320,45 +422,91 @@ public class ClientSample {
 			// Submit job and only return once it's complete
 			System.out.println(String.format("Synchronously streaming job #%s of %s", i, inputPayloadList.size()));
 			
-			if (executorService != null) {
-				executorService.execute(new Runnable() {
-					public void run() {
-						streamPayloadSynchronously(settings, processedJobs, inputPayload);
-					}					
-				});
-			} else {
-				streamPayloadSynchronously(settings, processedJobs, inputPayload);
-			}				
-		}
-
-		if (executorService != null) {
-			executorService.shutdown();
-			boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
-
-			if (timedOut) {
-				throw new TimeoutException("Operation timed out");
-			}
-			// reset
-			executorService = Executors.newFixedThreadPool(threadCount);
+			streamPayloadSynchronously(settings, processedJobs, inputPayload, sendReceiveBytesWhenStreaming);
 		}
 		
 		if (processedJobs.size() == 0) {
 			throw new Exception("Could not submit any files (see previous error)");
 		}
-
-		downloadProcessedJobFilesAndSetOutputFileNames(executorService, settings, processedJobs, outputDirectoryRoot);
 		
 		return processedJobs;
 	}
 	
-	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeStreamingAsync(Settings settings, List<Payload> inputPayloadList, File outputDirectoryRoot) throws Exception {
-		int threadCount = clientSampleSettings.getInt("clientSampleThreadCount", 1);
+	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeStreamingSyncThreaded(
+			Settings settings, 
+			List<Payload> inputPayloadList, 
+			boolean sendReceiveBytesWhenStreaming,
+			int threadCount) throws Exception {
 		
-		ExecutorService executorService = null;
+		ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
 		
-		if (threadCount > 1) {
-			executorService = Executors.newFixedThreadPool(threadCount);
+		final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs = new ConcurrentLinkedQueue<ProcessedJobResponse>();
+		
+		int i = 0;
+		for (Payload inputPayload : inputPayloadList) {
+			i++;
+			// Submit job and only return once it's complete
+			System.out.println(String.format("Synchronously streaming job #%s of %s", i, inputPayloadList.size()));
+			
+			// queue new thread
+			executorService.execute(new Runnable() {
+					public void run() {
+						streamPayloadSynchronously(settings, processedJobs, inputPayload, sendReceiveBytesWhenStreaming);
+					}					
+				});							
 		}
+
+		executorService.shutdown();
+		boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
+
+		if (timedOut) {
+			throw new TimeoutException("Operation timed out");
+		}
+		
+		if (processedJobs.size() == 0) {
+			throw new Exception("Could not submit any files (see previous error)");
+		}
+		
+		return processedJobs;
+	}
+	
+	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeStreamingAsync(
+			Settings settings, 
+			List<Payload> inputPayloadList,
+			boolean sendReceiveBytesWhenStreaming) throws Exception {
+		
+		final ArrayOflong fileIds = new ArrayOflong();
+		final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs = new ConcurrentLinkedQueue<ProcessedJobResponse>();
+		
+		int i = 0;
+		for (Payload inputPayload : inputPayloadList) {
+			i++;
+			// Submit job and only return once it's complete
+			System.out.println(String.format("Submitting job #%s of %s", i, inputPayloadList.size()));
+			
+			streamPayloadAsynchronously(settings, fileIds, inputPayload, sendReceiveBytesWhenStreaming);
+		}
+		
+		if (fileIds.getLong().size() == 0) {
+			throw new Exception("Could not submit any files (see previous error)");
+		}
+		
+		System.out.println(String.format("All %s jobs submitted, waiting up to %s seconds for completion of all jobs...",
+					fileIds.getLong().size(), settings.getDefaultTimeout().toMillis() / 1000.0));
+		
+		waitForJobsToProcess(settings, fileIds, processedJobs);
+		
+		return processedJobs;
+		
+	}
+	
+	private static ConcurrentLinkedQueue<ProcessedJobResponse> executeStreamingAsyncThreaded(
+			Settings settings, 
+			List<Payload> inputPayloadList, 
+			boolean sendReceiveBytesWhenStreaming,
+			int threadCount) throws Exception {
+				
+		ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
 
 		final ArrayOflong fileIds = new ArrayOflong();
 		final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs = new ConcurrentLinkedQueue<ProcessedJobResponse>();
@@ -369,27 +517,21 @@ public class ClientSample {
 			// Submit job and only return once it's complete
 			System.out.println(String.format("Submitting job #%s of %s", i, inputPayloadList.size()));
 			
-			if (executorService != null) {
-				executorService.execute(new Runnable() {
+			executorService.execute(new Runnable() {
 					public void run() {
-						streamPayloadAsynchronously(settings, fileIds, inputPayload);
+						streamPayloadAsynchronously(settings, fileIds, inputPayload, sendReceiveBytesWhenStreaming);
 					}					
-				});
-			} else {
-				streamPayloadAsynchronously(settings, fileIds, inputPayload);
-			}				
+				});		
 		}
 
-		if (executorService != null) {
-			executorService.shutdown();
-			boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
+		executorService.shutdown();
+		boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
 
-			if (timedOut) {
-				throw new TimeoutException("Operation timed out");
-			}
-			// reset
-			executorService = Executors.newFixedThreadPool(threadCount);
+		if (timedOut) {
+			throw new TimeoutException("Operation timed out");
 		}
+		// reset
+		executorService = Executors.newFixedThreadPool(threadCount);
 		
 		if (fileIds.getLong().size() == 0) {
 			throw new Exception("Could not submit any files (see previous error)");
@@ -398,9 +540,8 @@ public class ClientSample {
 		System.out.println(String.format("All %s jobs submitted, waiting up to %s seconds for completion of all jobs...",
 					fileIds.getLong().size(), settings.getDefaultTimeout().toMillis() / 1000.0));
 		
-		// If threaded, add fileIds to thread pool to have them all call/wait in own thread
-		if (executorService != null) {
-			for (long fileId : fileIds.getLong()) {
+		// add fileIds to thread pool to have them all call/wait in own thread
+		for (long fileId : fileIds.getLong()) {
 				executorService.execute(new Runnable() {
 					public void run() {
 						try {
@@ -413,14 +554,7 @@ public class ClientSample {
 						}
 					}					
 				});
-			}
-			
-		} else {
-			processedJobs.addAll(client.waitForJobsToProcess(fileIds, settings.getDefaultTimeout(),
-					settings.getDefaultPollingInterval()));
-		}	
-		
-		downloadProcessedJobFilesAndSetOutputFileNames(executorService, settings, processedJobs, outputDirectoryRoot);
+		}		
 		
 		return processedJobs;
 		
@@ -453,10 +587,11 @@ public class ClientSample {
 		}
 	}
 
-	private static void downloadProcessedJobFilesAndSetOutputFileNames(ExecutorService executorService, 
+	private static void downloadProcessedJobFilesAndSetOutputFileNames( 
 			Settings settings, 
 			ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs,
-			File outputDirectoryRoot) throws Exception {
+			File outputDirectoryRoot, 
+			boolean sendReceiveBytesWhenStreaming) throws Exception {
 		if (outputDirectoryRoot.exists()) {
 			try {
 				FileUtils.deleteDirectory(outputDirectoryRoot);
@@ -467,7 +602,7 @@ public class ClientSample {
 				e.printStackTrace();
 			}
 		}
-
+		
 		FileUtils.forceMkdir(outputDirectoryRoot);
 
 		for (ProcessedJobResponse processedJob : processedJobs) {
@@ -484,28 +619,66 @@ public class ClientSample {
 						processedJob.getFileId()));
 			}
 
-			if (executorService != null) {
-				executorService.execute(new Runnable() {
-					public void run() {
-						downloadFile(processedJob, outputDirectoryRoot, settings);
-					}					
-				});
-			} else {
-				downloadFile(processedJob, outputDirectoryRoot, settings);
-			}
-		}
-		
-		if (executorService != null) {
-			executorService.shutdown();
-			boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
-
-			if (timedOut) {
-				throw new TimeoutException("Operation timed out");
-			}
+			downloadFile(processedJob, outputDirectoryRoot, settings, sendReceiveBytesWhenStreaming);
 		}
 	}
+	
+	private static void downloadProcessedJobFilesAndSetOutputFileNamesThreaded( 
+			Settings settings, 
+			ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs,
+			File outputDirectoryRoot,
+			int threadCount, 
+			boolean sendReceiveBytesWhenStreaming) throws Exception {
+		if (outputDirectoryRoot.exists()) {
+			try {
+				FileUtils.deleteDirectory(outputDirectoryRoot);
+				Thread.sleep(500);
+			} catch (IOException e) {
+				e.printStackTrace();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+		}
 
-	private static void downloadFile(ProcessedJobResponse processedJob, File outputDirectoryRoot, Settings settings) {
+		ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
+		
+		FileUtils.forceMkdir(outputDirectoryRoot);
+
+		for (ProcessedJobResponse processedJob : processedJobs) {
+
+			if (!processedJob.isSuccessful()) {
+				System.out.println(String.format("Job %s not successful, skipping copy...", processedJob.getFileId()));
+				continue;
+			} else if (processedJob.getOutputPayload().getFiles().getJobFile().size() == 0 && settings.isDownloadJobPayloadOutputFiles()) {
+				System.out.println(String.format("Job %s is successful, but has not output files, skipping...",
+						processedJob.getFileId()));
+				continue;
+			} else {
+				System.out.println(String.format("Job %s is successful, downloading output...",
+						processedJob.getFileId()));
+			}
+
+			executorService.execute(new Runnable() {
+					public void run() {
+						downloadFile(processedJob, outputDirectoryRoot, settings, sendReceiveBytesWhenStreaming);
+					}					
+				});
+		}
+		
+		executorService.shutdown();
+		boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
+
+		if (timedOut) {
+			throw new TimeoutException("Operation timed out");
+		}
+		
+	}
+
+	private static void downloadFile(
+			ProcessedJobResponse processedJob, 
+			File outputDirectoryRoot, 
+			Settings settings, 
+			boolean sendReceiveBytesWhenStreaming) {
 		try {
 			File payloadSubFolder = new File(outputDirectoryRoot, String.valueOf(processedJob.getFileId()));
 			FileUtils.forceMkdir(payloadSubFolder);
@@ -515,8 +688,23 @@ public class ClientSample {
 				filesDownloaded = client.downloadOutputPayloadFiles(processedJob, payloadSubFolder, DownloadFileNamingMode.APPEND_OUTPUT_EXTENSION);
 			}
 			else {
-				filesDownloaded = client.downloadLibraryRendition
-					(processedJob, payloadSubFolder, RenditionType.PDF, DownloadFileNamingMode.APPEND_OUTPUT_EXTENSION, null);
+				if (sendReceiveBytesWhenStreaming) {
+					
+					String fileName = Common.getMetadataValueByName
+							(processedJob.getOutputPayload().getMetadata(), "OriginalFileName", "output").toString() + ".pdf";
+					File outputPath = new File(payloadSubFolder, fileName);
+					
+					System.out.println("Getting file as byte array...");
+					byte[] fileContent = client.downloadLibraryRendition(processedJob, RenditionType.PDF);
+					System.out.println(String.format("Writing byte array to file: %s...", outputPath.getPath()));
+					Files.write(outputPath.toPath(), fileContent);
+					filesDownloaded = new ArrayList<File>();
+					filesDownloaded.add(outputPath);
+				} else {
+					filesDownloaded = client.downloadLibraryRendition
+							(processedJob, payloadSubFolder, RenditionType.PDF, DownloadFileNamingMode.APPEND_OUTPUT_EXTENSION, null);
+				}
+				
 			}			
 
 			if (filesDownloaded.size() > 0) {
@@ -534,7 +722,7 @@ public class ClientSample {
 		
 	}
 
-	private static void copyProcessedJobFilesAndSetOutputFileNames(ExecutorService executorService, ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs,
+	private static void copyProcessedJobFilesAndSetOutputFileNames(ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs,
 			File outputDirectoryRoot, Settings settings) throws Exception {
 		if (outputDirectoryRoot.exists()) {
 			try {
@@ -546,6 +734,38 @@ public class ClientSample {
 				e.printStackTrace();
 			}
 		}
+		
+		FileUtils.forceMkdir(outputDirectoryRoot);
+
+		for (ProcessedJobResponse completedJob : processedJobs) {
+
+			if (!completedJob.isSuccessful()) {
+				System.out.println(String.format("Job %s not successful, skipping copy...", completedJob.getFileId()));
+				continue;
+			}
+			if (completedJob.getOutputPayload().getFiles().getJobFile().size() == 0) {
+				System.out.println(String.format("Job %s is successful, but has not output files, skipping...",
+						completedJob.getFileId()));
+				continue;
+			}
+			
+			handleCopyOutput(outputDirectoryRoot, completedJob);
+		}
+	}
+	
+	private static void copyProcessedJobFilesAndSetOutputFileNamesThreaded(ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs,
+			File outputDirectoryRoot, Settings settings, int threadCount) throws Exception {
+		if (outputDirectoryRoot.exists()) {
+			try {
+				FileUtils.deleteDirectory(outputDirectoryRoot);
+				Thread.sleep(500);
+			} catch (IOException e) {
+				e.printStackTrace();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+		}
+		ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
 
 		FileUtils.forceMkdir(outputDirectoryRoot);
 
@@ -561,24 +781,18 @@ public class ClientSample {
 				continue;
 			}
 			
-			if (executorService != null) {
-				executorService.execute(new Runnable() {
-					public void run() {
-						handleCopyOutput(outputDirectoryRoot, completedJob);						
-					}					
-				});
-			} else {
-				handleCopyOutput(outputDirectoryRoot, completedJob);
-			}	
+			executorService.execute(new Runnable() {
+				public void run() {
+					handleCopyOutput(outputDirectoryRoot, completedJob);						
+				}					
+			});
 		}
 		
-		if (executorService != null) {
-			executorService.shutdown();
-			boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
+		executorService.shutdown();
+		boolean timedOut = !executorService.awaitTermination(settings.getDefaultTimeout().toMinutes(), TimeUnit.MINUTES);
 
-			if (timedOut) {
-				throw new TimeoutException("Operation timed out");
-			}
+		if (timedOut) {
+			throw new TimeoutException("Operation timed out");
 		}
 	}
 
@@ -625,7 +839,7 @@ public class ClientSample {
 				continue;
 			}
 			File[] files = folder.listFiles();
-			Payload inputPayload = Common.makePayload(files, payloadMetadata, true);				
+			Payload inputPayload = Common.makePayload(files, payloadMetadata, true, true);				
 			payloadList.add(inputPayload);
 		}
 		
@@ -666,7 +880,7 @@ public class ClientSample {
 		String jmsWsdlPattern = clientSampleSettings.getString("jobManagementServiceUrl", "https://${adlibServerFullyQualifiedName}:55583/Adlib/Services/JobManagement.svc?wsdl");
 		
 		if (clientSampleSettings.getString("adlibServerFullyQualifiedName").equals("adlibServerName.domain.com")) {
-			throw new IllegalArgumentException("adlibServerFullyQualifiedName in settings file must be changed from default of: adlibServerName.domain.com");
+			throw new IllegalArgumentException("adlibServerFullyQualifiedName in ClientSampleSettings.properties file must be changed from default of: adlibServerName.domain.com");
 		}
 		if (clientSampleSettings.getString("tokenServiceEncryptedPassword").equals("ChangeThis")) {
 			throw new IllegalArgumentException("tokenServiceEncryptedPassword in settings file must be changed from default of: ChangeThis");
@@ -763,13 +977,31 @@ public class ClientSample {
 		}
 	}
 
-	private static boolean streamPayloadSynchronously(Settings settings,
-			final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs, Payload inputPayload) {
+	private static boolean streamPayloadSynchronously(
+			Settings settings,
+			final ConcurrentLinkedQueue<ProcessedJobResponse> processedJobs, 
+			Payload inputPayload,
+			boolean sendReceiveBytesWhenStreaming) {
 		File firstFile = new File(inputPayload.getFiles().getJobFile().get(0).getPath());
 		System.out.println(String.format("Streaming job synchronously (first file name: %s)...", firstFile.getName()));
 		try {
-			ProcessedJobResponse response = client.streamSynchronousJob(settings.getRepositoryName(), inputPayload,
-					settings.getDefaultTimeout(), settings.getDefaultPollingInterval());
+			ProcessedJobResponse response = null;
+			
+			if (sendReceiveBytesWhenStreaming) {
+				List<byte[]> jobFiles = new ArrayList<byte[]>();
+				// Get byte array of all files
+				System.out.println("Converting input file(s) to byte arrays..");
+				for (JobFile jobFile : inputPayload.getFiles().getJobFile()) {
+					jobFiles.add(Files.readAllBytes(Paths.get(jobFile.getPath())));
+				}
+				response = client.streamSynchronousJob(settings.getRepositoryName(), inputPayload,
+						jobFiles,
+						settings.getDefaultTimeout(), settings.getDefaultPollingInterval());
+			} else {
+				response = client.streamSynchronousJob(settings.getRepositoryName(), inputPayload,
+						settings.getDefaultTimeout(), settings.getDefaultPollingInterval());
+			}
+			
 			processedJobs.add(response);
 			return true;
 		} catch (AdlibTimeoutException e) {
@@ -780,11 +1012,26 @@ public class ClientSample {
 		return false;
 	}
 
-	private static boolean streamPayloadAsynchronously(Settings settings, final ArrayOflong fileIds, Payload inputPayload) {
+	private static boolean streamPayloadAsynchronously(
+			Settings settings, 
+			final ArrayOflong fileIds, 
+			Payload inputPayload, 
+			boolean sendReceiveBytesWhenStreaming) {
 		File firstFile = new File(inputPayload.getFiles().getJobFile().get(0).getPath());
 		long fileId = -1;
 		try {
-			fileId = client.streamJob(settings.getRepositoryName(), inputPayload);
+			if (sendReceiveBytesWhenStreaming) {
+				List<byte[]> jobFiles = new ArrayList<byte[]>();
+				// Get byte array of all files
+				System.out.println("Converting input file(s) to byte arrays..");
+				for (JobFile jobFile : inputPayload.getFiles().getJobFile()) {
+					jobFiles.add(Files.readAllBytes(Paths.get(jobFile.getPath())));
+				}
+				fileId = client.streamJob(settings.getRepositoryName(), inputPayload, jobFiles);
+			} else {
+				fileId = client.streamJob(settings.getRepositoryName(), inputPayload);
+			}
+			
 		} catch (Exception e) {
 			e.printStackTrace();
 			return false;
